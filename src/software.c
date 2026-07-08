@@ -271,6 +271,41 @@ void enumerate_devices(void)
 }
 
 /*
+ * Parse the first "<major>.<minor>" pair out of a Resident's rt_IdString
+ * (the "$VER: name major.minor (date)" string). Digit runs that are not
+ * followed by ".<digit>" (e.g. numbers embedded in the module name like
+ * "a2091.device") are skipped, so the first real version.revision pair wins.
+ */
+static BOOL parse_id_version(const char *s, UWORD *ver, UWORD *rev)
+{
+    if (!s) return FALSE;
+
+    while (*s) {
+        if (*s >= '0' && *s <= '9') {
+            const char *p = s;
+            UWORD major = 0, minor = 0;
+
+            while (*p >= '0' && *p <= '9')
+                major = (UWORD)(major * 10 + (*p++ - '0'));
+
+            if (*p == '.' && p[1] >= '0' && p[1] <= '9') {
+                p++;
+                while (*p >= '0' && *p <= '9')
+                    minor = (UWORD)(minor * 10 + (*p++ - '0'));
+                *ver = major;
+                *rev = minor;
+                return TRUE;
+            }
+            s = p;
+        } else {
+            s++;
+        }
+    }
+
+    return FALSE;
+}
+
+/*
  * Enumerate all resources
  */
 void enumerate_resources(void)
@@ -302,8 +337,32 @@ void enumerate_resources(void)
         }
 
         entry->address = (APTR)res;
-        entry->version = res->lib_Version;
-        entry->revision = res->lib_Revision;
+
+        /*
+         * Resource nodes are not struct Library: only the leading struct Node
+         * is guaranteed, so lib_Version/lib_Revision read whatever resource-
+         * specific data happens to sit at those offsets (see issue #51, where
+         * filesystem.resource showed "65108.0"). Take the version from the
+         * matching Resident module instead, mirroring what "version <name>"
+         * reports. Resources with no resident (e.g. the runtime-created
+         * ciaa/ciab.resource) are left at 0.0.
+         */
+        entry->version = 0;
+        entry->revision = 0;
+        if (res->lib_Node.ln_Name) {
+            struct Resident *rt =
+                FindResident((CONST_STRPTR)res->lib_Node.ln_Name);
+            if (rt) {
+                UWORD v = 0, r = 0;
+                if (parse_id_version(rt->rt_IdString, &v, &r)) {
+                    entry->version = v;
+                    entry->revision = r;
+                } else {
+                    entry->version = rt->rt_Version;
+                }
+            }
+        }
+
         entry->location = determine_mem_location(mmu_physical_address((APTR)res));
 
         resources_list.count++;
