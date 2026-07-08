@@ -140,8 +140,9 @@ lha: $(TARGET) TinySetPatch catalogs
 		lang=$$(basename $$(dirname "$$catalog")); \
 		cp "$$catalog" "$(LHA_DIR)/xSysInfo_$$lang.catalog"; \
 	done
-	@lha aqo5 $(LHA_OPTS) $(LHA_NAME) $(LHA_DIR)
-	@rm -rf $(LHA_DIR)
+	@cp docs/dir.info $(LHA_DIR).info
+	@lha aqo5 $(LHA_OPTS) $(LHA_NAME) $(LHA_DIR) $(LHA_DIR).info
+	@rm -rf $(LHA_DIR) $(LHA_DIR).info
 	@echo "Created $(LHA_NAME)"
 
 $(TARGET): $(OBJS) $(ASM_OBJS)
