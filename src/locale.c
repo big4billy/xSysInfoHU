@@ -281,7 +281,7 @@ static const char *default_strings[MSG_COUNT] = {
     /* MSG_SOUND_SYSTEM */           "Sound",
     /* MSG_PAULA_UNKNOWN */          "Unknown Paula",
     /* MSG_PAULA_ORIG */             "Paula 8364",
-    /* MSG_PAULA_SAGA */             "SAGA Paula",
+    /* MSG_PAULA_SAGA */             "SAGA Arne",
     /* MSG_DENISE_OCS */             "Denise 8362 (OCS)",
     /* MSG_DENISE_ECS */             "Denise 8373 (ECS)",
     /* MSG_DENISE_LISA */            "Lisa 4203",
