@@ -1441,6 +1441,21 @@ retry_speed_test:
 cleanup:
     if (buffer) FreeMem(buffer, buffer_size);
     if (device_opened) {
+        if (is_floppy) {
+            /* Reads start a floppy motor automatically, but closing the
+             * device does not stop it.  Turn it off on every exit path. */
+            io->io_Command = TD_MOTOR;
+            io->io_Data = NULL;
+            io->io_Length = 0;
+            io->io_Offset = 0;
+            io->io_Actual = 0;
+            io->io_Flags = 0;
+
+            error = DoIO((struct IORequest *)io);
+            debug("  drives: Motor off on %s unit %ld: error %ld/%ld\n",
+                  (LONG)drive->handler_name, (LONG)drive->unit_number,
+                  (LONG)error, (LONG)io->io_Error);
+        }
         CloseDevice((struct IORequest *)io);
         WaitTOF();
     }
