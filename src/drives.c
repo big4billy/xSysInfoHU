@@ -51,6 +51,8 @@ DriveList drive_list;
 #define DRIVE_SPEED_TARGET_US   1000000UL
 #define DRIVE_SPEED_MAX_US      2000000UL
 #define DRIVE_SPEED_MAX_BYTES   (32UL * 1024UL * 1024UL)
+#define DRIVE_SPEED_FLOPPY_TRACKS 3UL
+#define DRIVE_SPEED_DD_SECTORS    11UL
 
 #define DRIVE_INFO_X        120
 #define DRIVE_VALUE_OFFSET  224
@@ -1138,7 +1140,6 @@ ULONG measure_drive_speed(ULONG index)
     struct EClockVal start, end;
     uint64_t elapsed;
     ULONG bytes_per_sec = 0;
-    ULONG num_reads = 0;
     ULONG max_test_bytes;
     ULONG target_us = 0;
     ULONG max_us = 0;
@@ -1187,10 +1188,15 @@ ULONG measure_drive_speed(ULONG index)
     block_size = drive->bytes_per_block ? drive->bytes_per_block : 512;
     is_floppy = is_floppy_device(get_geometry_total_blocks(drive));
     if (is_floppy) {
-        /* Floppy: read small amount (one track worth) */
-        buffer_size = 11 * 512;  /* 11 sectors * 512 bytes */
-        num_reads = 2;
-        max_test_bytes = buffer_size * num_reads;
+        ULONG sectors_per_track = drive->sectors_per_track ?
+                                  drive->sectors_per_track :
+                                  DRIVE_SPEED_DD_SECTORS;
+
+        /* Read three complete logical tracks.  Besides giving the test more
+         * data, this includes both a side change and a cylinder step on a
+         * normal two-sided floppy. */
+        buffer_size = sectors_per_track * block_size;
+        max_test_bytes = buffer_size * DRIVE_SPEED_FLOPPY_TRACKS;
     } else {
         buffer_size = DRIVE_SPEED_HARD_CHUNK;
         max_test_bytes = DRIVE_SPEED_MAX_BYTES;
@@ -1349,7 +1355,7 @@ retry_speed_test:
     /* Perform reads */
     while (TRUE) {
         if (is_floppy) {
-            if (reads_done >= num_reads) {
+            if (total_read >= max_test_bytes) {
                 break;
             }
         } else {
