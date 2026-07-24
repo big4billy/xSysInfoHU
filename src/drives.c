@@ -787,6 +787,25 @@ static void prune_drive_list(void)
 }
 
 /*
+ * Helper: Sort drives alphabetically by DOS device name
+ */
+static void sort_drive_list(void)
+{
+    ULONG i, j;
+
+    for (i = 0; i + 1 < drive_list.count; i++) {
+        for (j = 0; j + 1 < drive_list.count - i; j++) {
+            if (strcmp(drive_list.drives[j].device_name,
+                       drive_list.drives[j + 1].device_name) > 0) {
+                DriveInfo temp = drive_list.drives[j];
+                drive_list.drives[j] = drive_list.drives[j + 1];
+                drive_list.drives[j + 1] = temp;
+            }
+        }
+    }
+}
+
+/*
  * Enumerate all drives
  */
 void enumerate_drives(void)
@@ -811,6 +830,9 @@ void enumerate_drives(void)
     debug("  drives: Prune non-drives...\n");
     /* Fourth pass: Drop entries with no drive evidence */
     prune_drive_list();
+
+    debug("  drives: Sort drive list...\n");
+    sort_drive_list();
 
     debug("  drives: Check SCSI-support...\n");
     /* Fifth pass: Check SCSI support */
