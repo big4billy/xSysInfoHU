@@ -37,6 +37,8 @@
 #define CUSTOM_JOY0DAT_MIRR  0xDAF00A
 #define CUSTOM_JOY1DAT   0xDFF00C
 #define CUSTOM_JOY1DAT_MIRR  0xDAF00C
+#define CUSTOM_INTENAR   0xDFF01C
+#define CUSTOM_INTENAR_MIRR  0xDAF01C
 #define CUSTOM_PAULA_ID  0xDFF016
 #define CUSTOM_DENISE_ID  0xDFF07C
 #define CUSTOM_VPOSR    0xDFF004
@@ -46,9 +48,6 @@
 #define FAT_GARY_POWER_REG 0xDE0002
 #define FAT_GARY_POWER_CYCLE 0x80
 #define FAT_GARY_POWER_GOOD 0x0
-#define FAT_GARY_TIME_OUT_REG 0xDE0000
-#define FAT_GARY_TIME_OUT_DSACK 0x0
-#define FAT_GARY_TIME_OUT_BERR 0x80
 #define SDMAC_ISTR      ((volatile uint8_t *)0xDD001F)
 #define SDMAC_WTC       ((volatile uint32_t *)0xDD0004)
 #define SDMAC_WD_ASR    ((volatile uint8_t *)0xDD0049)
@@ -195,6 +194,11 @@ typedef struct {
     ULONG bus_mhz;          /* Measured motherboard MHz * 100; 0 unavailable */
     char cpu_string[32];
 
+    /* PPC information supplied by a running PowerUP/WarpOS kernel. */
+    BOOL ppc_present;
+    ULONG ppc_revision, ppc_mhz, ppc_bus_mhz;
+    char ppc_string[24], ppc_runtime[48];
+
     /* FPU */
     FPUType fpu_type;
     BOOL fpu_enabled;
@@ -234,6 +238,12 @@ typedef struct {
 
     PaulaType paula_type;
     UWORD paula_rev;
+
+    BOOL akiko_present;
+    ULONG akiko_id;
+    BOOL akiko_c2p_enabled;
+    BOOL gayle_pcmcia_valid;
+    UBYTE gayle_pcmcia_status, gayle_pcmcia_config;
 
     /* Clock */
     ClockType clock_type;
@@ -289,7 +299,7 @@ typedef struct {
     UWORD kickstart_revision;
     UWORD kickstart_patch_version;
     UWORD kickstart_patch_revision;
-    ULONG kickstart_size;
+    ULONG kickstart_size;         /* KiB, including mapped ROM extensions */
 
 } HardwareInfo;
 
@@ -304,6 +314,7 @@ void refresh_cache_status(void);
 BOOL detect_emu68_systems(void);
 void detect_amiga_model(void);
 void detect_cpu(void);
+void detect_ppc(void);
 void detect_fpu(void);
 struct Library *open_mmu_library(void);
 void detect_mmu(void);

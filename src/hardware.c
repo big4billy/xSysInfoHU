@@ -36,6 +36,7 @@
 #include "cache.h"
 #include "benchmark.h" //for frequencies
 #include "berr_trap.h"
+#include "rom.h"
 
 typedef struct DeviceTreeProperty {
     struct DeviceTreeProperty *next;
@@ -66,6 +67,8 @@ struct Library *MMUBase;
 extern struct ExecBase *SysBase;
 extern struct GfxBase *GfxBase;
 
+static void probe_agnus_alias(void);
+
 /*
  * Main hardware detection function
  */
@@ -84,6 +87,7 @@ BOOL detect_hardware(void)
     else {
         debug("  hw: Emu68-System detected...\n");
     }
+    detect_ppc();
     debug("  hw: Detecting FPU...\n");
     detect_fpu();
     debug("  hw: Detecting MMU...\n");
@@ -99,6 +103,8 @@ BOOL detect_hardware(void)
     detect_native_graphics();
     debug("  hw: Detecting system chips...\n");
     detect_system_chips();
+    if (g_debug_enabled)
+        probe_agnus_alias();
     debug("  hw: Detecting clock...\n");
     detect_clock();
     debug("  hw: Detecting batt mem resources...\n");
@@ -137,15 +143,9 @@ void detect_kickstart(void)
         hw_info.kickstart_revision = SysBase->SoftVer;
     }
 
-    /* Get ROM size*/
-    UWORD kick_size = *((volatile UWORD *)0xF80000);
-    if (kick_size == 0x1111) {
-        hw_info.kickstart_size = 256;
-    }
-    else {
-        /* Fallback: default to 512K */
-        hw_info.kickstart_size = 512;
-    }
+    hw_info.kickstart_size = detect_rom_size(
+        hw_info.amiga_model_id == IDSYS_AMIGA1200,
+        hw_info.gary_type == FAT_GARY);
 
     //save SysBase-Version in case we are softkicking
     hw_info.kickstart_patch_version = SysBase->LibNode.lib_Version;
@@ -1002,6 +1002,133 @@ void detect_chipset(void)
 }
 
 /*
+ * Experimental ECS address-decoding check, reported only in DEBUG output.
+ * A 1 MB Agnus may mirror the lower megabyte into the upper one. This
+ * measures that alias, not the chip's part number or installed RAM size.
+ *
+ * Use an owned buffer instead of WhichAmiga's writes to addresses 0/4.
+ * Restricting the probe to a plain 68000 avoids CPU caches and MMU
+ * translations of either address. A missing mmu.library or remap-table
+ * entry would not establish that on an accelerator. Do not disable an MMU
+ * to perform this diagnostic.
+ */
+static void probe_agnus_alias(void)
+{
+    static const UBYTE pattern[8] = {
+        0x3c, 0xa5, 0x96, 0x69, 0x5a, 0xc3, 0x87, 0x78
+    };
+    volatile UBYTE *buffer;
+    ULONG address;
+    UBYTE samples[2][sizeof(pattern)];
+    ULONG pass, i, matches = 0;
+    BOOL fault = FALSE, changed = FALSE;
+
+    switch (hw_info.agnus_type) {
+        case AGNUS_ECS_PAL:
+        case AGNUS_ECS_NTSC:
+        case AGNUS_ECS_B_PAL:
+        case AGNUS_ECS_B_NTSC:
+        case AGNUS_ECS_2MB_PAL:
+        case AGNUS_ECS_2MB_NTSC:
+            break;
+        default:
+            return;
+    }
+
+    if (hw_info.cpu_type != CPU_68000 || hw_info.mmu_type != MMU_NONE) {
+        debug("    Agnus alias: skipped (probe requires a plain 68000)\n");
+        return;
+    }
+
+    buffer = AllocMem(sizeof(pattern), MEMF_CHIP);
+    if (!buffer) {
+        debug("    Agnus alias: inconclusive (no Chip RAM buffer)\n");
+        return;
+    }
+    address = (ULONG)buffer;
+    /* Exclude the first 32 KB and keep the entire buffer below 1 MB. */
+    if (address < 0x8000 || address > 0x100000 - sizeof(pattern)) {
+        debug("    Agnus alias: skipped (buffer $%08lx outside probe range)\n",
+              address);
+        FreeMem((APTR)buffer, sizeof(pattern));
+        return;
+    }
+
+    debug("    Agnus alias: buffer $%08lx, reading $%08lx\n",
+          address, address + 0x100000);
+    for (pass = 0; pass < 2; pass++) {
+        BOOL match = TRUE;
+        UBYTE mask = pass ? 0xff : 0;
+
+        /* No OS calls that can wait while the exception vectors are hooked. */
+        Disable();
+        for (i = 0; i < sizeof(pattern); i++)
+            buffer[i] = pattern[i] ^ mask;
+        for (i = 0; i < sizeof(pattern); i++) {
+            if (berr_probe_byte(address + 0x100000 + i,
+                                &samples[pass][i]) != 0) {
+                fault = TRUE;
+                break;
+            }
+            if (samples[pass][i] != (UBYTE)(pattern[i] ^ mask))
+                match = FALSE;
+        }
+        for (i = 0; i < sizeof(pattern); i++) {
+            if (buffer[i] != (UBYTE)(pattern[i] ^ mask))
+                changed = TRUE;
+        }
+        Enable();
+
+        if (fault || changed)
+            break;
+        if (match)
+            matches++;
+        debug("    Agnus alias: pass %lu%s, upper bytes", pass + 1,
+              pass ? " (inverted pattern)" : "");
+        for (i = 0; i < sizeof(pattern); i++)
+            debug(" %02lx", (ULONG)samples[pass][i]);
+        debug("\n");
+    }
+    FreeMem((APTR)buffer, sizeof(pattern));
+
+    if (fault)
+        debug("    Agnus alias: inconclusive (upper address faulted)\n");
+    else if (changed)
+        debug("    Agnus alias: inconclusive (buffer verification failed)\n");
+    else if (matches == 2)
+        debug("    Agnus alias: mirrored with both patterns\n");
+    else if (matches == 0)
+        debug("    Agnus alias: no mirror observed with either pattern\n");
+    else
+        debug("    Agnus alias: inconclusive (patterns disagree)\n");
+}
+
+/* Only access these registers on positively identified hardware. The ID
+ * and PCMCIA status/configuration reads do not acknowledge interrupts. */
+static void detect_additional_chips(void)
+{
+    if (hw_info.gary_type == GAYLE &&
+        (hw_info.gary_rev == 0xd0 || hw_info.gary_rev == 0xd1)) {
+        hw_info.gayle_pcmcia_status = *(volatile UBYTE *)0xda8000;
+        hw_info.gayle_pcmcia_config = *(volatile UBYTE *)0xdab000;
+        hw_info.gayle_pcmcia_valid = TRUE;
+        debug("    Gayle: ID $%02lx, PCMCIA status $%02lx, config $%02lx\n",
+              (ULONG)hw_info.gary_rev, (ULONG)hw_info.gayle_pcmcia_status,
+              (ULONG)hw_info.gayle_pcmcia_config);
+    }
+    if (hw_info.amiga_model_id == IDSYS_CD32 ||
+        (GfxBase->LibNode.lib_Version >= 40 &&
+         (ULONG)GfxBase->ChunkyToPlanarPtr == 0xb80038)) {
+        hw_info.akiko_id = *(volatile ULONG *)0xb80000;
+        hw_info.akiko_present = (hw_info.akiko_id & 0xffff) == 0xcafe;
+        hw_info.akiko_c2p_enabled = GfxBase->LibNode.lib_Version >= 40 &&
+                                   (ULONG)GfxBase->ChunkyToPlanarPtr == 0xb80038;
+        debug("    Akiko: ID $%08lx, graphics C2P %ld\n",
+              hw_info.akiko_id, (LONG)hw_info.akiko_c2p_enabled);
+    }
+}
+
+/*
  * Detect RTC clock chip
  */
 void detect_clock(void)
@@ -1065,7 +1192,7 @@ void detect_clock(void)
     // A Spirit Insider 1000 maps an MK48T02 TimeKeeper with its clock
     // registers on odd bytes at $DC0FF1..$DC0FFF.  Probe under bus-error
     // protection so we don't crash on machines without the card.
-    // Only plain 68000 is supported here (VBR=0 and simple group-0 frame).
+    // Keep the optional A1000 clock probe restricted to unaccelerated CPUs.
     if (hw_info.gary_type == GARY_A1000 && hw_info.cpu_type == CPU_68000) {
         UBYTE sec = 0, min = 0, hour = 0, day = 0, date = 0, mon = 0;
         if (berr_probe_byte(0xDC0FF3, &sec) == 0 &&
@@ -1107,8 +1234,16 @@ void detect_clock(void)
  */
 void detect_batt_mem(void)
 {
-    hw_info.battMemData.available = openBattMem();
+    /* The OKI MSM6242 has no user RAM. A resource alone does not prove
+     * that the detected RTC provides battery-backed configuration RAM. */
+    hw_info.battMemData.available = FALSE;
     hw_info.battMemData.valid_data = FALSE;
+
+    if (hw_info.clock_type != CLOCK_RP5C01 &&
+        hw_info.clock_type != CLOCK_MK48T02)
+        return;
+
+    hw_info.battMemData.available = openBattMem();
 
     if (hw_info.battMemData.available) {
         hw_info.battMemData.valid_data = readBattMem(&hw_info.battMemData);
@@ -1185,15 +1320,13 @@ static BOOL detect_ncr53c770(unsigned char *revision)
     int attempt;
 
     for (attempt = 0; attempt < 4; attempt++) {
-        uint8_t old_timeout, gpcntl, macntl, ctest3;
+        UBYTE gpcntl, macntl, ctest3;
         BOOL valid;
 
-        old_timeout = *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG);
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = FAT_GARY_TIME_OUT_DSACK;
-        gpcntl = *((volatile uint8_t *)NCR770_GPCNTL_REG);
-        macntl = *((volatile uint8_t *)NCR770_MACNTL_REG);
-        ctest3 = *((volatile uint8_t *)NCR770_CTEST3_REG);
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = old_timeout;
+        if (berr_probe_byte(NCR770_GPCNTL_REG, &gpcntl) ||
+            berr_probe_byte(NCR770_MACNTL_REG, &macntl) ||
+            berr_probe_byte(NCR770_CTEST3_REG, &ctest3))
+            return FALSE;
 
         /* GPIO0-3 inputs, GPIO4 output; MACNTL chip type 2 is 53C770. */
         valid = ((gpcntl & 0x1f) == 0x0f) && ((macntl >> 4) == 2);
@@ -1220,21 +1353,23 @@ static BOOL detect_ncr53c770(unsigned char *revision)
  * SCRIPTS execution; values describe the configuration at detection time. */
 static void read_ncr_config(void)
 {
-    volatile UBYTE *base = (volatile UBYTE *)(hw_info.ncr_type == NCR_53C770 ?
-                                             0xdd0000 : 0xdd0040);
-    UBYTE old_timeout = *(volatile UBYTE *)FAT_GARY_TIME_OUT_REG;
+    static const UBYTE offsets[] = {0x07, 0x06, 0x03, 0x02, 0x3b, 0x00, 0x4e};
+    UBYTE values[7] = {0};
+    BOOL wide = hw_info.ncr_type == NCR_53C770;
+    ULONG base = wide ? 0xdd0000 : 0xdd0040;
+    unsigned i;
 
-    *(volatile UBYTE *)FAT_GARY_TIME_OUT_REG = FAT_GARY_TIME_OUT_DSACK;
-    hw_info.ncr_config.scid = base[0x07];
-    hw_info.ncr_config.sxfer = base[0x06];
-    hw_info.ncr_config.scntl0 = base[0x03];
-    hw_info.ncr_config.scntl1 = base[0x02];
-    hw_info.ncr_config.dmode = base[0x3b];
-    if (hw_info.ncr_type == NCR_53C770) {
-        hw_info.ncr_config.scntl3 = base[0x00];
-        hw_info.ncr_config.stest1 = base[0x4e];
+    for (i = 0; i < (wide ? 7 : 5); i++) {
+        if (berr_probe_byte(base + offsets[i], &values[i]))
+            return;
     }
-    *(volatile UBYTE *)FAT_GARY_TIME_OUT_REG = old_timeout;
+    hw_info.ncr_config.scid = values[0];
+    hw_info.ncr_config.sxfer = values[1];
+    hw_info.ncr_config.scntl0 = values[2];
+    hw_info.ncr_config.scntl1 = values[3];
+    hw_info.ncr_config.dmode = values[4];
+    hw_info.ncr_config.scntl3 = values[5];
+    hw_info.ncr_config.stest1 = values[6];
     debug("    ncr: SCID=%02x SXFER=%02x SCNTL0=%02x SCNTL1=%02x "
           "DMODE=%02x SCNTL3=%02x STEST1=%02x\n",
           hw_info.ncr_config.scid, hw_info.ncr_config.sxfer,
@@ -1247,11 +1382,10 @@ static void read_ncr_config(void)
 void detect_sdmac(void)
 {
     unsigned char ncr_rev;
-    uint32_t ovalue, rvalue;
+    ULONG ovalue, rvalue, revision;
     uint8_t sdmac_version = 0;
-    uint8_t istr;
+    UBYTE istr, asr;
     int pass;
-    uint8_t old_timeout;
     hw_info.sdmac_rev = 0;
     hw_info.sdmac_present = FALSE;
     hw_info.resdmac_version = 0;
@@ -1268,21 +1402,14 @@ void detect_sdmac(void)
             return;
         }
 
-        // Switch to DSACK timeout to avoid bus errors when probing
-        old_timeout = *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG);
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = FAT_GARY_TIME_OUT_DSACK;
-
-        // now test for A4000T NCR53C710: upper four bits of CTEST8-register contains the chip-rev.
-        ncr_rev = *((volatile unsigned char *)(NCR_CTEST8_REG));
-        ncr_rev = (ncr_rev & 0xF0) >> 4; // only upper four bits matter
-        if (ncr_rev != 0 && ncr_rev != 0xF)
-        {
-            hw_info.ncr_rev = ncr_rev;
-            hw_info.ncr_type = NCR_53C710;
+        /* A4000T NCR53C710: CTEST8 contains the revision nibble. */
+        if (berr_probe_byte(NCR_CTEST8_REG, &ncr_rev) == 0) {
+            ncr_rev >>= 4;
+            if (ncr_rev != 0 && ncr_rev != 0xf) {
+                hw_info.ncr_rev = ncr_rev;
+                hw_info.ncr_type = NCR_53C710;
+            }
         }
-
-        // Restore original timeout mode
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = old_timeout;
         if (hw_info.ncr_type != NCR_NONE)
             read_ncr_config();
     }
@@ -1290,42 +1417,40 @@ void detect_sdmac(void)
     /* SDMAC access requires Fat Gary and Ramsey. */
     if (hw_info.ramsey_rev > 0 && hw_info.gary_type == FAT_GARY &&
         hw_info.ncr_type == NCR_NONE) {
-        // Switch to DSACK timeout to avoid bus errors on A4000
-        old_timeout = *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG);
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = FAT_GARY_TIME_OUT_DSACK;
-
         /* ReSDMAC exposes four ASCII bytes (e.g. "v1.2"), not a chip
          * revision byte. Validate the whole signature and its stability. */
-        rvalue = *(volatile uint32_t *)SDMAC_REVISION;
-        if ((rvalue & 0xff00ff00UL) == 0x76002e00UL &&
+        if (berr_probe_long(SDMAC_REVISION, &rvalue) == 0 &&
+            (rvalue & 0xff00ff00UL) == 0x76002e00UL &&
             ((rvalue >> 16) & 0xff) >= '0' &&
             ((rvalue >> 16) & 0xff) <= '9' &&
             (rvalue & 0xff) >= '0' && (rvalue & 0xff) <= '9') {
             (void)*(volatile uint8_t *)RAMSEY_VER;
-            if (rvalue == *(volatile uint32_t *)SDMAC_REVISION) {
+            if (berr_probe_long(SDMAC_REVISION, &revision) == 0 &&
+                rvalue == revision) {
                 hw_info.resdmac_version = rvalue;
                 hw_info.sdmac_present = TRUE;
                 hw_info.sdmac_rev = 4;
             }
         }
         if (hw_info.resdmac_version)
-            goto sdmac_done;
+            return;
         if (hw_info.sdmac_rev == 0) {
             /* Quick check: ISTR bits - FIFO cannot be both empty and full */
-            istr = *SDMAC_ISTR;
-            if (istr == 0xff)
-                goto sdmac_done;
+            if (berr_probe_byte((ULONG)SDMAC_ISTR, &istr) || istr == 0xff)
+                return;
             if ((istr & SDMAC_ISTR_FIFOE) && (istr & SDMAC_ISTR_FIFOF))
-                goto sdmac_done;
+                return;
             /* ASR is read-only and does not acknowledge WD interrupts.
              * Reserved bits 2/3 distinguish open bus from a WD33C93. */
-            if (*SDMAC_WD_ASR & WD_ASR_RESERVED)
-                goto sdmac_done;
+            if (berr_probe_byte((ULONG)SDMAC_WD_ASR, &asr) ||
+                (asr & WD_ASR_RESERVED))
+                return;
             hw_info.sdmac_present = TRUE;
             sdmac_version = 2; //default version
             /* Probe WTC registers to distinguish SDMAC-02 from SDMAC-04 */
             for (pass = 0; pass < 6; pass++) {
                 uint32_t wvalue;
+                int fault;
                 switch (pass) {
                     case 0: wvalue = 0x00000000; break;
                     case 1: wvalue = 0xffffffff; break;
@@ -1337,23 +1462,27 @@ void detect_sdmac(void)
                 Disable();
                 /* Never change a transfer count while SCSI is active or
                  * awaiting service (INT, BSY, CIP, DBR in the WD ASR). */
-                if ((*SDMAC_WD_ASR & (WD_ASR_ACTIVE | WD_ASR_RESERVED)) ||
-                    *SDMAC_ISTR != SDMAC_ISTR_FIFOE) {
+                if (berr_probe_byte((ULONG)SDMAC_WD_ASR, &asr) ||
+                    berr_probe_byte((ULONG)SDMAC_ISTR, &istr) ||
+                    (asr & (WD_ASR_ACTIVE | WD_ASR_RESERVED)) ||
+                    istr != SDMAC_ISTR_FIFOE ||
+                    berr_probe_long((ULONG)SDMAC_WTC, &ovalue)) {
                     Enable();
-                    goto sdmac_done;
+                    return;
                 }
-                ovalue = *(volatile uint32_t *)SDMAC_WTC;
                 *(volatile uint32_t *)SDMAC_WTC = wvalue;
                 (void) *(volatile uint32_t *)RAMSEY_VER; /* Push write to bus */
-                rvalue = *(volatile uint32_t *)SDMAC_WTC;
+                fault = berr_probe_long((ULONG)SDMAC_WTC, &rvalue);
                 *(volatile uint32_t *)SDMAC_WTC = ovalue;
                 (void) *(volatile uint32_t *)RAMSEY_VER;
                 Enable();
+                if (fault)
+                    return;
                 if (rvalue == wvalue) {
                     if ((wvalue != 0x00000000) && (wvalue != 0xffffffff)) {
                         sdmac_version = 0; /* Detection failed */
                         hw_info.sdmac_present = FALSE;
-                        goto sdmac_done;
+                        return;
                     }
                 } else if (((rvalue ^ wvalue) & 0x00ffffff) == 0) {
                     /* SDMAC-02: only upper byte differs */
@@ -1365,14 +1494,11 @@ void detect_sdmac(void)
                 else {
                     sdmac_version = 0; /* Detection failed */
                     hw_info.sdmac_present = FALSE;
-                    goto sdmac_done;
+                    return;
                 }
             }
             hw_info.sdmac_rev = sdmac_version;
         }
-sdmac_done:
-        // Restore original timeout mode
-        *((volatile uint8_t *)FAT_GARY_TIME_OUT_REG) = old_timeout;
     }
 }
 
@@ -1555,7 +1681,14 @@ void detect_gary(void)
         testVal1 = *((volatile UWORD *)(CUSTOM_JOY1DAT));
         testVal2 = *((volatile UWORD *)(CUSTOM_JOY0DAT)); //avoid bus stickiness (A3000)
         testVal2 = *((volatile UWORD *)(CUSTOM_JOY1DAT_MIRR));
+        /* Idle ports read $0000, as does unmapped space such as WinUAE's
+         * A1200 Gayle window. INTENAR is nonzero while the OS runs. */
         if (testVal1 == testVal2) {
+            testVal1 = *((volatile UWORD *)(CUSTOM_INTENAR));
+            testVal2 = *((volatile UWORD *)(CUSTOM_JOY0DAT)); //avoid bus stickiness (A3000)
+            testVal2 = *((volatile UWORD *)(CUSTOM_INTENAR_MIRR));
+        }
+        if (testVal1 != 0 && testVal1 == testVal2) {
             hw_info.gary_type = GARY_A1000;
             /* An OCS A1000 has a DIP Agnus; the VPOSR mirror test in
              * detect_chipset() can misread Fat Agnus on expanded machines.
@@ -1634,6 +1767,7 @@ void detect_system_chips(void)
     detect_ramsey();
     debug("    systemchips: Detecting SDMAC...\n");
     detect_sdmac();
+    detect_additional_chips();
 
 
     debug("    systemchips: Detecting bus system...\n");

@@ -35,9 +35,10 @@ typedef struct {
 
 /* Memory region list */
 typedef struct {
-    MemoryRegion regions[MAX_MEMORY_REGIONS];
+    MemoryRegion *regions;    /* Allocated to fit the regions */
     ULONG count;
-    ULONG total_chip_size;    /* Detected region capacities, including reserved bytes */
+    ULONG capacity;
+    ULONG total_chip_size;    /* Installed memory, including bytes exec reserves */
     ULONG total_fast_size;
 } MemoryRegionList;
 
@@ -46,6 +47,7 @@ extern MemoryRegionList memory_regions;
 
 /* Function prototypes */
 void enumerate_memory_regions(void);
+void free_memory_regions(void);
 void refresh_memory_region(ULONG index);
 
 /* Get memory type as string */
@@ -59,5 +61,7 @@ ULONG measure_memory_speed(ULONG index);
 
 /* Draw memory view */
 void draw_memory_view(void);
+
+void format_memory_speed(const MemoryRegion *region, char *buffer, size_t size);
 
 #endif /* MEMORY_H */

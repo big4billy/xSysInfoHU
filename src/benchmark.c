@@ -66,13 +66,9 @@ void format_reference_label(char *buffer, size_t buffer_size, const ReferenceSys
 
 /* Timer resources */
 static struct MsgPort *timer_port = NULL;
-static struct MsgPort *etimer_port = NULL;
 static struct timerequest *timer_req = NULL;
 struct Device *TimerBase = NULL;
 static BOOL timer_open = FALSE;
-static struct timerequest *etimer_req = NULL;
-struct Device *ETimerBase = NULL;
-static BOOL etimer_open = FALSE;
 
 
 /* External references */
@@ -105,38 +101,6 @@ BOOL init_timer(void)
     timer_open = TRUE;
     TimerBase = (struct Device *)timer_req->tr_node.io_Device;
 
-    if (SysBase->LibNode.lib_Version < 36) {
-        return TRUE;
-    }
-
-    etimer_port = CreatePort(NULL, 0);
-    if (!etimer_port) {
-        debug("    init_timer: no etimer_port, falling back to microhz timer\n");
-        return TRUE;
-    }
-
-    etimer_req = (struct timerequest *)
-        CreateExtIO(etimer_port, sizeof(struct timerequest));
-    if (!etimer_req) {
-        debug("    init_timer: no etimer_req, falling back to microhz timer\n");
-        DeletePort(etimer_port);
-        etimer_port = NULL;
-        return TRUE;
-    }
-
-    if (OpenDevice((CONST_STRPTR)"timer.device", UNIT_ECLOCK,
-                   (struct IORequest *)etimer_req, 0) != 0) {
-        debug("    init_timer: no OpenDevice etimer_req, falling back to microhz timer\n");
-        DeleteExtIO((struct IORequest *)etimer_req);
-        etimer_req = NULL;
-        DeletePort(etimer_port);
-        etimer_port = NULL;
-        return TRUE;
-    }
-
-    ETimerBase = (struct Device *)etimer_req->tr_node.io_Device;
-    etimer_open = TRUE;
-
     return TRUE;
 }
 
@@ -155,29 +119,12 @@ void cleanup_timer(void)
         timer_req = NULL;
     }
 
-    if (etimer_open) {
-        CloseDevice((struct IORequest *)etimer_req);
-        etimer_open = FALSE;
-    }
-
-    if (etimer_req) {
-        DeleteExtIO((struct IORequest *)etimer_req);
-        etimer_req = NULL;
-    }
-
     if (timer_port) {
         DeletePort(timer_port);
         timer_port = NULL;
     }
 
-    if (etimer_port) {
-        DeletePort(etimer_port);
-        etimer_port = NULL;
-    }
-
-
     TimerBase = NULL;
-    ETimerBase = NULL;
 }
 
 BOOL benchmark_timer_available(void)
@@ -212,18 +159,9 @@ ULONG read_benchmark_clock(struct EClockVal *val)
         return 0;
     }
 
-    if (ETimerBase && etimer_open) {
+    if (TimerBase->dd_Library.lib_Version >= 36 &&
+        SysBase->LibNode.lib_Version >= 36) {
         return ReadEClock(val);
-    }
-
-    if (SysBase->LibNode.lib_Version >= 36) {
-        /*
-         * GetSysTime() is a V36+ timer.device call. timeval and EClockVal
-         * share the same two ULONG fields, so the diff helper below can
-         * reuse them; returning 0 selects its microsecond path.
-         */
-        GetSysTime((struct timeval *)val);
-        return 0;
     }
 
     /*
@@ -881,8 +819,6 @@ static ULONG dhrystone_sample(ULONG loops, BOOL disable_interrupts,
         *failure = "EClock frequency changed";
     else if (end.ev_hi != start.ev_hi + (end.ev_lo < start.ev_lo))
         *failure = "invalid EClock interval";
-    else if (end.ev_lo == start.ev_lo)
-        *failure = "EClock did not advance";
     if (*failure)
         return 0;
 
@@ -898,31 +834,40 @@ static ULONG run_dhrystone_chunks(void)
     ULONG calibration_loops = 0, calibration_ticks = 0;
     ULONG target_ticks = 0, limit_ticks = 0, chunks = 0, total_loops = 0;
     ULONG shortest = ~0UL, longest = 0, attempt;
+    ULONG restarts = 0;
     uint64_t total_ticks = 0, next_loops, goal_ticks;
     const char *failure = NULL;
 
     if (!Dhry_Initialize()) return 0;
 
     Forbid();
-    for (attempt = 0; attempt < 3; attempt++) {
+    for (attempt = 0; attempt < 6; attempt++) {
         ticks = dhrystone_sample(loops, FALSE, &frequency, &failure);
-        if (!ticks) goto done;
+        if (failure) goto done;
         /* Aim for at least 10 ms of calibration on fast processors. */
-        if (ticks >= frequency / 100 || loops == max_loops || attempt == 2)
+        if ((ticks && (ticks >= frequency / 100 || attempt >= 2)) ||
+            loops == max_loops)
             break;
-        next_loops = (uint64_t)loops * frequency / (100ULL * ticks) + 1;
+        /* A short JIT run may finish before the clock advances. Grow the
+         * interruptible calibration, but still reject a stalled clock. */
+        next_loops = ticks ?
+            (uint64_t)loops * frequency / (100ULL * ticks) + 1 :
+            (uint64_t)loops * 16;
         loops = next_loops > max_loops ? max_loops : (ULONG)next_loops;
+    }
+    if (!ticks) {
+        failure = "EClock did not advance";
+        goto done;
     }
     calibration_loops = loops;
     calibration_ticks = ticks;
 
-    /* Target 75 ms, with a 90 ms rejection limit. Also bound both by the
-     * 16-bit hardware period if a machine reports an unusual E-clock rate.
+    /* Target 75 ms, with a 90 ms rejection limit: below the CIA timer
+     * period on PAL and NTSC machines. ReadEClock can instead expose a
+     * high-frequency host clock, whose ticks are not 16-bit CIA counts.
      * Enable() between chunks lets timer.device account for overflows. */
     limit_ticks = (uint64_t)frequency * 90 / 1000;
-    if (limit_ticks > 0xff00) limit_ticks = 0xff00;
     target_ticks = (uint64_t)frequency * 75 / 1000;
-    if (target_ticks >= limit_ticks) target_ticks = limit_ticks * 3 / 4;
     if (!target_ticks || (uint64_t)ticks >= (uint64_t)loops * limit_ticks) {
         failure = "iteration too long for EClock chunk";
         goto done;
@@ -940,8 +885,23 @@ static ULONG run_dhrystone_chunks(void)
         if (loops > max_loops - total_loops)
             loops = max_loops - total_loops;
         ticks = dhrystone_sample(loops, TRUE, &frequency, &failure);
-        if (!ticks) goto done;
+        if (failure) goto done;
         if (ticks >= limit_ticks) {
+            /* JIT warm-up and host scheduling can invalidate calibration.
+             * Discard the whole attempt, rather than selecting only its
+             * fast chunks. Do not scale from a potentially wrapped time.
+             * Two halvings still leave room for two seconds in 128 chunks.
+             */
+            if (restarts < 2 && loops > 1 && target_ticks > 1) {
+                restarts++;
+                target_ticks /= 2;
+                loops /= 2;
+                chunks = total_loops = 0;
+                total_ticks = 0;
+                shortest = ~0UL;
+                longest = 0;
+                continue;
+            }
             failure = "chunk exceeds EClock timing limit";
             goto done;
         }
@@ -951,18 +911,25 @@ static ULONG run_dhrystone_chunks(void)
         if (ticks < shortest) shortest = ticks;
         if (ticks > longest) longest = ticks;
 
-        /* Calibration can include interrupt work. Converge on the target
-         * using measured chunks, limiting growth to twice the loop count. */
-        next_loops = (uint64_t)loops * target_ticks / ticks;
+        /* JIT clocks may advance in coarse steps. Keep sub-tick work in
+         * the totals and grow the next chunk instead of dividing by zero.
+         * Calibration can include interrupt work, so limit growth to 2x. */
+        next_loops = ticks ? (uint64_t)loops * target_ticks / ticks :
+                            (uint64_t)loops * 2;
         if (next_loops > (uint64_t)loops * 2) next_loops = (uint64_t)loops * 2;
         if (next_loops > max_loops) next_loops = max_loops;
         loops = next_loops ? (ULONG)next_loops : 1;
     }
-    if (chunks == max_chunks && total_ticks < goal_ticks &&
+    if (!total_ticks)
+        failure = "EClock did not advance";
+    else if (chunks == max_chunks && total_ticks < goal_ticks &&
         total_loops < max_loops)
         failure = "chunk limit before sufficient elapsed time";
 done:
     Permit();
+    if (restarts)
+        debug("  bench: Dhrystone restarted %lu times after chunk overruns\n",
+              restarts);
     if (calibration_ticks)
         debug("  bench: Dhrystone calibration: %lu loops in %lu us\n",
               calibration_loops,
