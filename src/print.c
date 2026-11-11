@@ -343,8 +343,7 @@ static void export_hardware(ReportOutput *fh)
         format_scaled(mhz_buf, sizeof(mhz_buf), hw_info.cpu_mhz, TRUE);
         if (hw_info.cpu_mhz)
             snprintf(frequency, sizeof(frequency), " %s MHz", mhz_buf);
-        if (hw_info.cpu_revision[0] != '\0' &&
-            strcmp(hw_info.cpu_revision, "N/A") != 0) {
+        if (hw_info.cpu_revision[0] != '\0') {
             snprintf(buffer, sizeof(buffer), "%s (%s)%s",
                      hw_info.cpu_string, hw_info.cpu_revision, frequency);
         } else {
@@ -366,8 +365,12 @@ static void export_hardware(ReportOutput *fh)
     format_fpu_string(buffer, sizeof(buffer));
     write_formatted(fh, "%-16s %s", "FPU:", buffer);
 
-    if (hw_info.mmu_enabled) {
+    if (hw_info.mmu_translation == MMU_TRANSLATION_ENABLED) {
         snprintf(buffer, sizeof(buffer), "%s (In use)", hw_info.mmu_string);
+    } else if (hw_info.mmu_translation == MMU_TRANSLATION_UNKNOWN &&
+               hw_info.mmu_type != MMU_NONE) {
+        snprintf(buffer, sizeof(buffer), "%s (%s)", hw_info.mmu_string,
+                 get_string(MSG_UNKNOWN));
     } else {
         strncpy(buffer, hw_info.mmu_string, sizeof(buffer) - 1);
     }
@@ -506,11 +509,28 @@ static void export_hardware(ReportOutput *fh)
 /*
  * Export software lists
  */
+/* The overview rows of the System Software panel: OS, ROMs, Workbench,
+ * SetPatch, graphics system and PPC runtime. */
+static void export_software_overview(ReportOutput *out, BOOL colon)
+{
+    ULONG i;
+    char buffer[80], label[32];
+
+    for (i = 0; i < software_overview_count(); i++) {
+        snprintf(label, sizeof(label), "%s%s",
+                 get_string(software_overview_label(i)), colon ? ":" : "");
+        write_formatted(out, "%-16s %s", label,
+            format_software_overview_value(i, buffer, sizeof(buffer)));
+    }
+}
+
 static void export_software(ReportOutput *fh)
 {
     ULONG i;
 
     WRITE_LINE(fh, "=== SYSTEM SOFTWARE ===");
+    WRITE_LINE(fh, "");
+    export_software_overview(fh, TRUE);
     WRITE_LINE(fh, "");
 
     /* Libraries */
@@ -549,8 +569,10 @@ static void export_software(ReportOutput *fh)
     /* MMU entries */
     WRITE_LINE(fh, "--- MMU Entries ---");
     for (i = 0; i < mmu_list.count; i++) {
-        SoftwareEntry *e = &mmu_list.entries[i];
-        write_formatted(fh, "%s", e->name);
+        char text[sizeof(mmu_list.entries[i].name)];
+
+        write_formatted(fh, "%s",
+            software_entry_text(&mmu_list.entries[i], text, sizeof(text)));
     }
     WRITE_LINE(fh, "");
 }
@@ -817,13 +839,10 @@ static void brief_hardware_row(const HardwareInfoRow *row, void *context)
 static void export_brief(ReportOutput *out)
 {
     ULONG i;
-    char buffer[80];
 
     visit_hardware_rows(HARDWARE_STD, brief_hardware_row, out);
     WRITE_LINE(out, "");
-    for (i = 0; i < software_overview_count(); i++)
-        write_formatted(out, "%-16s %s", get_string(software_overview_label(i)),
-            format_software_overview_value(i, buffer, sizeof(buffer)));
+    export_software_overview(out, FALSE);
     WRITE_LINE(out, "");
     export_benchmarks(out, FALSE);
     WRITE_LINE(out, "=== EXPANSION BOARDS ===");
@@ -863,10 +882,22 @@ static BOOL emit_report(ReportFormat format, ReportOutput *out)
     return !out->failed;
 }
 
+/* Reports are written in English whatever catalog the GUI uses: they
+ * are read by other people, and detection stored built-in text. */
+static BOOL emit_english_report(ReportFormat format, ReportOutput *out)
+{
+    BOOL ok;
+
+    locale_set_builtin_only(TRUE);
+    ok = emit_report(format, out);
+    locale_set_builtin_only(FALSE);
+    return ok;
+}
+
 BOOL export_report_to_handle(BPTR fh, ReportFormat format)
 {
     ReportOutput out = { write_file, &fh, FALSE };
-    return fh && emit_report(format, &out);
+    return fh && emit_english_report(format, &out);
 }
 
 typedef struct {
@@ -909,7 +940,7 @@ BOOL create_report(ReportText *report, ReportFormat format)
     ULONG i, line = 0;
     char *start;
 
-    if (!emit_report(format, &out)) goto failed;
+    if (!emit_english_report(format, &out)) goto failed;
     for (i = 0; i < buffer.length; i++)
         if (buffer.text[i] == '\n') result.count++;
     if (!result.count || result.count > LONG_MAX / sizeof(char *)) goto failed;

@@ -424,11 +424,22 @@ typedef enum {
     MSG_REPORT_FAILED,
     MSG_BTN_REPORT,
 
+    /* System software overview: network stack */
+    MSG_NETWORK,
+    MSG_NOT_RUNNING,
+
     MSG_COUNT  /* Total number of strings */
 } LocaleStringID;
 
 /* Get localized string by ID */
 const char *get_string(LocaleStringID id);
+/* The built-in (English) text, regardless of the open catalog. */
+const char *get_builtin_string(LocaleStringID id);
+/* Catalog text for a stored built-in string of a known message; the
+ * text itself when it is anything else. */
+const char *localize_builtin(const char *text);
+/* While set, get_string() returns built-in text: reports are English. */
+void locale_set_builtin_only(BOOL on);
 
 /* Initialize locale (returns TRUE if successful) */
 BOOL init_locale(void);

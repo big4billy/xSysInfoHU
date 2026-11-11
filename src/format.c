@@ -54,28 +54,30 @@ static void format_cpu_value(char *buffer, size_t size)
                       hw_info.cpu_mhz, FALSE);
     }
 
-    if (hw_info.cpu_revision[0] != '\0' &&
-        strcmp(hw_info.cpu_revision, "N/A") != 0) {
+    if (hw_info.cpu_revision[0] != '\0') {
         snprintf(buffer, size, "%s (%s)%s",
-                 hw_info.cpu_string, hw_info.cpu_revision, mhz_buf);
+                 localize_builtin(hw_info.cpu_string), hw_info.cpu_revision,
+                 mhz_buf);
     } else {
-        snprintf(buffer, size, "%s%s", hw_info.cpu_string, mhz_buf);
+        snprintf(buffer, size, "%s%s", localize_builtin(hw_info.cpu_string),
+                 mhz_buf);
     }
 }
 
 static void format_fpu_value(char *buffer, size_t size)
 {
+    const char *fpu = localize_builtin(hw_info.fpu_string);
+
     if (hw_info.fpu_type != FPU_NONE && !hw_info.fpu_enabled) {
-        snprintf(buffer, size, "%s (%s)",
-                 hw_info.fpu_string, get_string(MSG_OFF));
+        snprintf(buffer, size, "%s (%s)", fpu, get_string(MSG_OFF));
     } else if (hw_info.fpu_type != FPU_NONE &&
                hw_info.fpu_type != FPU_UNKNOWN && hw_info.fpu_mhz > 0) {
         char mhz_buf[16];
 
         format_scaled(mhz_buf, sizeof(mhz_buf), hw_info.fpu_mhz, FALSE);
-        snprintf(buffer, size, "%s %s", hw_info.fpu_string, mhz_buf);
+        snprintf(buffer, size, "%s %s", fpu, mhz_buf);
     } else {
-        snprintf(buffer, size, "%s", hw_info.fpu_string);
+        snprintf(buffer, size, "%s", fpu);
     }
 }
 
@@ -84,17 +86,22 @@ static void format_mmu_value(char *buffer, size_t size)
     char mmu_value[sizeof(hw_info.mmu_string)];
     const char *uncertainty = strstr(hw_info.mmu_string, " (");
 
-    /* detect_mmu() adds a localized uncertainty suffix; keep it compact here. */
+    /* detect_mmu() adds an "(uncertain)" suffix; keep it compact here. */
     if (uncertainty) {
         snprintf(mmu_value, sizeof(mmu_value), "%.*s?",
                  (int)(uncertainty - hw_info.mmu_string), hw_info.mmu_string);
     } else {
-        copy_string(mmu_value, hw_info.mmu_string, sizeof(mmu_value));
+        copy_string(mmu_value, localize_builtin(hw_info.mmu_string),
+                    sizeof(mmu_value));
     }
 
-    if (hw_info.mmu_enabled) {
+    if (hw_info.mmu_translation == MMU_TRANSLATION_ENABLED) {
         snprintf(buffer, size, "%s (%s)",
                  mmu_value, get_string(MSG_IN_USE));
+    } else if (hw_info.mmu_translation == MMU_TRANSLATION_UNKNOWN &&
+               hw_info.mmu_type != MMU_NONE) {
+        snprintf(buffer, size, "%s (%s)",
+                 mmu_value, get_string(MSG_UNKNOWN));
     } else {
         copy_string(buffer, mmu_value, size);
     }
@@ -254,46 +261,82 @@ static void format_gary_value(char *buffer, size_t size)
     }
 }
 
-static const LocaleStringID software_labels[] = {
-    MSG_OPERATING_SYSTEM, MSG_ROM, MSG_ACTIVE_ROM, MSG_WORKBENCH,
-    MSG_SETPATCH, MSG_GRAPHICS_SYSTEM, MSG_PPC_RUNTIME
+enum {
+    ROW_OS, ROW_ROM, ROW_ACTIVE_ROM, ROW_WORKBENCH, ROW_SETPATCH,
+    ROW_GRAPHICS, ROW_NETWORK, ROW_PPC_RUNTIME, ROW_COUNT
 };
+
+/* Callers size their row tables, and MUI its value gadgets, by the max. */
+_Static_assert(ROW_COUNT <= SOFTWARE_OVERVIEW_MAX_ROWS,
+               "SOFTWARE_OVERVIEW_MAX_ROWS is smaller than the row kinds");
+
+static const LocaleStringID software_labels[ROW_COUNT] = {
+    MSG_OPERATING_SYSTEM, MSG_ROM, MSG_ACTIVE_ROM, MSG_WORKBENCH,
+    MSG_SETPATCH, MSG_GRAPHICS_SYSTEM, MSG_NETWORK, MSG_PPC_RUNTIME
+};
+
+/* Active ROM only adds information when a ROM update replaced the
+ * Kickstart, and the PPC runtime only exists on PowerPC boards. */
+static ULONG software_overview_rows(UBYTE rows[SOFTWARE_OVERVIEW_MAX_ROWS])
+{
+    ULONG count = 0, kind;
+
+    for (kind = ROW_OS; kind < ROW_COUNT; kind++) {
+        if (kind == ROW_ACTIVE_ROM &&
+            hw_info.kickstart_patch_version == hw_info.kickstart_version &&
+            hw_info.kickstart_patch_revision == hw_info.kickstart_revision)
+            continue;
+        if (kind == ROW_PPC_RUNTIME && !hw_info.ppc_runtime[0])
+            continue;
+        rows[count++] = (UBYTE)kind;
+    }
+    return count;
+}
+
+static ULONG software_overview_row(ULONG row)
+{
+    UBYTE rows[SOFTWARE_OVERVIEW_MAX_ROWS];
+
+    return row < software_overview_rows(rows) ? rows[row] : ROW_PPC_RUNTIME;
+}
 
 ULONG software_overview_count(void)
 {
-    return hw_info.ppc_runtime[0] ? 7 : 6;
+    UBYTE rows[SOFTWARE_OVERVIEW_MAX_ROWS];
+
+    return software_overview_rows(rows);
 }
 
 LocaleStringID software_overview_label(ULONG row)
 {
-    return row < 7 ? software_labels[row] : MSG_NA;
+    return software_labels[software_overview_row(row)];
 }
 
 const char *format_software_overview_value(ULONG row, char *buffer,
                                            size_t size)
 {
-    switch (row) {
-    case 0:
+    switch (software_overview_row(row)) {
+    case ROW_OS:
         return system_software.os_name[0] ? system_software.os_name :
                get_string(MSG_UNKNOWN_OS);
-    case 1:
+    case ROW_ROM:
         snprintf(buffer, size, "%u.%u (%lu KB)",
                  hw_info.kickstart_version, hw_info.kickstart_revision,
                  (unsigned long)hw_info.kickstart_size);
         return buffer;
-    case 2:
+    case ROW_ACTIVE_ROM:
         snprintf(buffer, size, "%u.%u",
                  hw_info.kickstart_patch_version,
                  hw_info.kickstart_patch_revision);
         return buffer;
-    case 3:
+    case ROW_WORKBENCH:
         if (!system_software.has_workbench_version)
             return get_string(MSG_NA);
         snprintf(buffer, size, "%u.%u",
                  system_software.workbench_version,
                  system_software.workbench_revision);
         return buffer;
-    case 4:
+    case ROW_SETPATCH:
         if (!system_software.has_setpatch_version)
             return get_string(MSG_NA);
         if (system_software.is_tinysetpatch)
@@ -307,8 +350,16 @@ const char *format_software_overview_value(ULONG row, char *buffer,
                      system_software.setpatch_version,
                      system_software.setpatch_revision);
         return buffer;
-    case 5:
-        return system_software.graphics_system;
+    case ROW_GRAPHICS:
+        return localize_builtin(system_software.graphics_system);
+    case ROW_NETWORK:
+        if (!system_software.network_stack[0])
+            return get_string(MSG_NONE);
+        if (!system_software.network_not_running)
+            return system_software.network_stack;
+        snprintf(buffer, size, "%s (%s)", system_software.network_stack,
+                 get_string(MSG_NOT_RUNNING));
+        return buffer;
     default:
         return hw_info.ppc_runtime;
     }
@@ -371,10 +422,12 @@ void visit_hardware_rows(HardwareType page, HardwareRowVisitor visit,
     HardwareOutput out = { visit, data, 0 };
     if (page == HARDWARE_STD) {
         /* Identify the machine before listing its components. */
-        hardware_row(&out, FALSE, "Amiga", hw_info.amiga_model_string);
+        hardware_row(&out, FALSE, "Amiga",
+                     localize_builtin(hw_info.amiga_model_string));
 
         /* Mode */
-        hardware_row(&out, FALSE, get_string(MSG_MODE), hw_info.mode_string);
+        hardware_row(&out, FALSE, get_string(MSG_MODE),
+                     localize_builtin(hw_info.mode_string));
 
         /* DMA/Gfx */
         format_agnus_value(buffer, sizeof(buffer));
@@ -410,7 +463,8 @@ void visit_hardware_rows(HardwareType page, HardwareRowVisitor visit,
         hardware_row(&out, FALSE, get_string(MSG_MMU), buffer);
 
         /* Comment */
-        hardware_row(&out, FALSE, get_string(MSG_COMMENT), hw_info.comment);
+        hardware_row(&out, FALSE, get_string(MSG_COMMENT),
+                     localize_builtin(hw_info.comment));
 
         if (hw_info.ramsey_rev) {
             if (hw_info.bus_mhz)
@@ -442,7 +496,8 @@ void visit_hardware_rows(HardwareType page, HardwareRowVisitor visit,
         hardware_row(&out, FALSE, get_string(MSG_SUPPLY_HZ), buffer);
 
         /* Card Slot */
-        hardware_row(&out, FALSE, get_string(MSG_CARD_SLOT), hw_info.card_slot_string);
+        hardware_row(&out, FALSE, get_string(MSG_CARD_SLOT),
+                     localize_builtin(hw_info.card_slot_string));
 
         format_size(memory_regions.total_chip_size, buffer, sizeof(buffer));
         hardware_row(&out, FALSE, get_string(MSG_CHIP_RAM), buffer);
@@ -614,7 +669,8 @@ void visit_hardware_rows(HardwareType page, HardwareRowVisitor visit,
             }
         }
     } else if (page == HARDWARE_CLOCK) {
-        hardware_row(&out, FALSE, get_string(MSG_CLOCK), hw_info.clock_string);
+        hardware_row(&out, FALSE, get_string(MSG_CLOCK),
+                     localize_builtin(hw_info.clock_string));
 
         {
             char values[2][24];

@@ -4,10 +4,11 @@
 /*
  * xSysInfo - GUI rendering and event handling
  *
- * The TextLength() calls immediately before Move()/Text() are deliberate
- * workarounds for missing text on AmiKit/AfA_OS setups. Keep them even
- * when the width is unused or was measured earlier. Their necessity must
- * be checked on an affected setup before changing this call sequence.
+ * Text() takes a 16-bit count in d0, and ROM graphics.library ignores the
+ * upper half of the register. AfA_OS 4.8 (used by AmiKit) patches Text()
+ * and tests the whole register, skipping the call when it looks negative.
+ * Pass the count zero-extended in d0. The current NDK inlines do this; an
+ * older inline style that set only the low word made text vanish (#29).
  */
 
 #include <string.h>
@@ -134,6 +135,8 @@ static void draw_bottom_buttons(void);
 static void draw_cache_buttons(void);
 static void clear_buttons(void);
 static void update_software_list(BOOL clear_content);
+static ULONG software_row_count(void);
+static BOOL software_panel_scrolls(void);
 static void update_hardware_text(void);
 static void refresh_all_cache_buttons(void);
 static void show_status_overlay_centered(const char *message,
@@ -143,6 +146,7 @@ static void show_speed_status_overlay(const char *message);
 static const char *get_hardware_page_label(void);
 static void refresh_hardware_benchmark_rows(void);
 static void build_hardware_rows(void);
+static void invalidate_hardware_rows(void);
 static void add_hardware_buttons(void);
 
 /* Shared by gradients, the logo, and TightText's ink/coverage planes.
@@ -274,10 +278,138 @@ static WORD draw_tight_text(struct RastPort *rp, int x, int y,
     return finalX;
 }
 
+/* TightText() lets the ROM's Text() compose the line through a copy of the
+ * UI font whose advances are squeezed to the tight width. The copy shares
+ * the glyph data and kerning and only adds an advance table. Composing
+ * every glyph row in C costs several times as much on a 68000. One copy
+ * per space width covers the labels and the speed factors. */
+#define TIGHT_FONTS 2
+
+struct TightFont {
+    const struct TextFont *base;
+    WORD target;
+    WORD space;
+    UWORD entries;
+    WORD *advances;
+    struct TextFont font;
+};
+
+static struct TightFont tight_fonts[TIGHT_FONTS];
+/* Text() reads kerning for every proportional font. */
+static WORD *zero_kerning;
+static UWORD zero_kerning_entries;
+
+static struct TextFont *get_tight_font(struct RastPort *rp, int target,
+                                       int space)
+{
+    const struct TextFont *base = rp->Font;
+    const WORD *kerning = base->tf_CharKern;
+    BOOL proportional = (base->tf_Flags & FPF_PROPORTIONAL) &&
+                        base->tf_CharSpace;
+    struct TightFont *slot = NULL;
+    UWORD entries, i;
+    int n;
+
+    /* Only plain bitmap fonts have nothing beyond the TextFont header,
+     * and Text() would apply soft styles and spacing that TightText
+     * never did. */
+    if ((base->tf_Style & ~(FSF_UNDERLINED | FSF_BOLD | FSF_ITALIC |
+                            FSF_EXTENDED)) ||
+        rp->AlgoStyle || rp->TxSpacing)
+        return NULL;
+
+    for (n = 0; n < TIGHT_FONTS; n++) {
+        struct TightFont *tight = &tight_fonts[n];
+
+        if (tight->base == base && tight->target == target &&
+            tight->space == space)
+            return &tight->font;
+        if (!tight->base && !slot)
+            slot = tight;
+    }
+    if (!slot)
+        return NULL;
+
+    /* The last entry is the glyph for characters outside the font. */
+    entries = base->tf_HiChar - base->tf_LoChar + 2;
+    if (!kerning) {
+        if (!zero_kerning) {
+            zero_kerning = AllocMem(entries * sizeof(WORD),
+                                    MEMF_ANY | MEMF_CLEAR);
+            if (!zero_kerning)
+                return NULL;
+            zero_kerning_entries = entries;
+        }
+        if (zero_kerning_entries < entries)
+            return NULL;
+        kerning = zero_kerning;
+    }
+    slot->advances = AllocMem(entries * sizeof(WORD), MEMF_ANY);
+    if (!slot->advances)
+        return NULL;
+
+    for (i = 0; i < entries; i++) {
+        WORD advance = proportional ?
+                       kerning[i] + ((WORD *)base->tf_CharSpace)[i] :
+                       base->tf_XSize;
+
+        if (i + base->tf_LoChar == ' ')
+            advance = space;
+        else if (advance > target)
+            advance = target;
+        /* Text() moves by kerning plus space. */
+        slot->advances[i] = advance - kerning[i];
+    }
+
+    slot->font = *base;
+    slot->font.tf_Message.mn_ReplyPort = NULL;  /* no TextFontExtension */
+    slot->font.tf_Flags |= FPF_PROPORTIONAL;
+    slot->font.tf_CharSpace = slot->advances;
+    slot->font.tf_CharKern = (APTR)kerning;
+    slot->base = base;
+    slot->target = target;
+    slot->space = space;
+    slot->entries = entries;
+    return &slot->font;
+}
+
+static void free_tight_fonts(void)
+{
+    int n;
+
+    for (n = 0; n < TIGHT_FONTS; n++) {
+        if (tight_fonts[n].advances)
+            FreeMem(tight_fonts[n].advances,
+                    tight_fonts[n].entries * sizeof(WORD));
+    }
+    memset(tight_fonts, 0, sizeof(tight_fonts));
+    if (zero_kerning)
+        FreeMem(zero_kerning, zero_kerning_entries * sizeof(WORD));
+    zero_kerning = NULL;
+    zero_kerning_entries = 0;
+}
+
 void TightText(struct RastPort *rp, int x, int y, CONST_STRPTR str,
                int charGap, int spaceWidth)
 {
-    draw_tight_text(rp, x, y, str, charGap, spaceWidth, -1, FALSE);
+    struct TextFont *base = rp->Font;
+    struct TextFont *tight = NULL;
+    UBYTE mode = rp->DrawMode;
+    int space = TextLength(rp, (CONST_STRPTR)" ", 1);
+
+    if (spaceWidth > space)
+        spaceWidth = space;
+    if (charGap < 0 && !(mode & (COMPLEMENT | INVERSVID)))
+        tight = get_tight_font(rp, 8 + charGap, spaceWidth);
+    if (!tight) {
+        draw_tight_text(rp, x, y, str, charGap, spaceWidth, -1, FALSE);
+        return;
+    }
+
+    SetFont(rp, tight);
+    Move(rp, x, y);
+    Text(rp, str, strlen((const char *)str));
+    SetFont(rp, base);
 }
 
 /*
@@ -423,15 +555,15 @@ void main_view_update_buttons(void)
     add_button(SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 14,
                SOFTWARE_PANEL_Y + 15, 12, 10,
                NULL, BTN_SOFTWARE_UP,
-               app->software_type != SOFTWARE_OVERVIEW);
+               software_panel_scrolls());
     add_button(SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 14,
                SOFTWARE_PANEL_Y + 15 + 10, 12, SOFTWARE_PANEL_H - 15 - 10 - 12,
                NULL, BTN_SOFTWARE_SCROLLBAR,
-               app->software_type != SOFTWARE_OVERVIEW);
+               software_panel_scrolls());
     add_button(SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 14,
                SOFTWARE_PANEL_Y + SOFTWARE_PANEL_H - 12, 12, 10,
                NULL, BTN_SOFTWARE_DOWN,
-               app->software_type != SOFTWARE_OVERVIEW);
+               software_panel_scrolls());
 
     /* Scale toggle button */
     add_button(SPEED_PANEL_X + SPEED_PANEL_W -
@@ -478,6 +610,7 @@ void main_view_handle_button(ButtonID id)
             Forbid();
             run_benchmarks();
             Permit();
+            invalidate_hardware_rows();
             hide_status_overlay();
             update_button_states();
             refresh_hardware_benchmark_rows();
@@ -556,12 +689,10 @@ void main_view_handle_button(ButtonID id)
             break;
 
         case BTN_SOFTWARE_DOWN:
-            {
-                SoftwareList *list = get_software_list(app->software_type);
-                if (list && app->software_scroll < (LONG)list->count - SOFTWARE_LIST_LINES) {
-                    app->software_scroll++;
-                    update_software_list(FALSE);
-                }
+            if (app->software_scroll <
+                (LONG)software_row_count() - SOFTWARE_LIST_LINES) {
+                app->software_scroll++;
+                update_software_list(FALSE);
             }
             break;
 
@@ -612,6 +743,24 @@ void update_button_states(void)
 }
 
 /*
+ * The main view's header and panels fill their own areas, so only the
+ * gaps between them need the background colour. Clearing the whole
+ * window first costs about 40 ms on a 68000 and flashes the panels.
+ */
+static void clear_main_view_gaps(void)
+{
+    struct RastPort *rp = app->rp;
+    WORD bottom = HARDWARE_PANEL_Y + HARDWARE_PANEL_H;
+
+    SetAPen(rp, COLOR_BACKGROUND);
+    RectFill(rp, 0, HEADER_HEIGHT, SCREEN_WIDTH - 1, SOFTWARE_PANEL_Y - 1);
+    RectFill(rp, SOFTWARE_PANEL_X + SOFTWARE_PANEL_W, HARDWARE_PANEL_Y,
+             HARDWARE_PANEL_X - 1, bottom - 1);
+    if (app->screen_height > bottom)
+        RectFill(rp, 0, bottom, SCREEN_WIDTH - 1, app->screen_height - 1);
+}
+
+/*
  * Draw the current view
  */
 void redraw_current_view(void)
@@ -619,8 +768,12 @@ void redraw_current_view(void)
     struct RastPort *rp = app->rp;
 
     /* Clear background */
-    SetAPen(rp, COLOR_BACKGROUND);
-    RectFill(rp, 0, 0, SCREEN_WIDTH - 1, app->screen_height - 1);
+    if (app->current_view == VIEW_MAIN) {
+        clear_main_view_gaps();
+    } else {
+        SetAPen(rp, COLOR_BACKGROUND);
+        RectFill(rp, 0, 0, SCREEN_WIDTH - 1, app->screen_height - 1);
+    }
 
     update_button_states();
 
@@ -671,6 +824,7 @@ BOOL init_drawing(void)
 
 void cleanup_drawing(void)
 {
+    free_tight_fonts();
     if (drawing_template) {
         WaitBlit();
         FreeMem(drawing_template, DRAWING_TEMPLATE_SIZE);
@@ -787,7 +941,8 @@ static void draw_header(void)
     UWORD title_len;
     UWORD subtitle_len;
 
-    draw_panel(0, 0, 640, HEADER_HEIGHT, NULL);
+    /* The gradient or fill below covers everything inside the border. */
+    draw_3d_box(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, FALSE);
 
     /* Title bar background with a dithered gradient, SysInfo-style */
     if (gradients_available()) {
@@ -846,9 +1001,12 @@ void draw_panel(WORD x, WORD y, WORD w, WORD h, const char *title)
     struct RastPort *rp = app->rp;
     UWORD title_len;
 
-    /* Panel background */
-    SetAPen(rp, COLOR_PANEL_BG);
-    RectFill(rp, x, y, x + w - 1, y + h - 1);
+    /* Panel background. A title strip fills its inside in its own colour
+     * below, and the border covers the outer edge. */
+    if (!title) {
+        SetAPen(rp, COLOR_PANEL_BG);
+        RectFill(rp, x, y, x + w - 1, y + h - 1);
+    }
 
     /* 3D border - top/left light */
     SetAPen(rp, COLOR_BUTTON_LIGHT);
@@ -949,7 +1107,6 @@ void draw_button(Button *btn)
 
         SetAPen(rp, btn->enabled ? COLOR_TEXT : COLOR_PANEL_BG);
         SetBPen(rp, btn->enabled ? COLOR_PANEL_BG : COLOR_BUTTON_DARK);
-        TextLength(rp, (CONST_STRPTR)btn->label, text_len);
         Move(rp, text_x, text_y);
         Text(rp, (CONST_STRPTR)btn->label, text_len);
     }
@@ -982,11 +1139,9 @@ void draw_cycle_button(Button *btn)
     text_y = btn->y + (btn->height - rp->TxHeight) / 2 + rp->TxBaseline;
 
     SetAPen(rp, shadow_text_color());
-    TextLength(rp, (CONST_STRPTR)">", 1);
     Move(rp, icon_x + 1, text_y + 1);
     Text(rp, (CONST_STRPTR)">", 1);
     SetAPen(rp, btn->enabled ? COLOR_HIGHLIGHT : COLOR_BACKGROUND);
-    TextLength(rp, (CONST_STRPTR)">", 1);
     Move(rp, icon_x, text_y);
     Text(rp, (CONST_STRPTR)">", 1);
 
@@ -996,11 +1151,9 @@ void draw_cycle_button(Button *btn)
         text_x = btn->x + 14;  /* After icon */
 
         SetAPen(rp, shadow_text_color());
-        TextLength(rp, (CONST_STRPTR)btn->label, text_len);
         Move(rp, text_x + 1, text_y + 1);
         Text(rp, (CONST_STRPTR)btn->label, text_len);
         SetAPen(rp, btn->enabled ? COLOR_HIGHLIGHT : COLOR_BACKGROUND);
-        TextLength(rp, (CONST_STRPTR)btn->label, text_len);
         Move(rp, text_x, text_y);
         Text(rp, (CONST_STRPTR)btn->label, text_len);
     }
@@ -1122,7 +1275,6 @@ static void draw_text_span(WORD x, WORD y, const char *text, WORD len,
 
     SetAPen(rp, color);
     SetBPen(rp, COLOR_PANEL_BG);
-    TextLength(rp, (CONST_STRPTR)text, len);
     Move(rp, x, y);
     Text(rp, (CONST_STRPTR)text, len);
 }
@@ -1349,6 +1501,7 @@ static void update_hardware_text(void)
 {
     Button *hw_cycle_btn;
 
+    invalidate_hardware_rows();
     update_button_states();
     hw_cycle_btn = find_button(BTN_HARDWARE_CYCLE);
 
@@ -1363,18 +1516,50 @@ static void update_hardware_text(void)
     draw_hardware_panel_contents();
 }
 
+/* Rows in the software panel: the selected list, or the overview. */
+static ULONG software_row_count(void)
+{
+    SoftwareList *list = get_software_list(app->software_type);
+
+    if (app->software_type == SOFTWARE_OVERVIEW)
+        return software_overview_count();
+    return list ? list->count : 0;
+}
+
+/* The overview fits the panel unless a ROM update and a PPC board add
+ * rows; only then does it scroll like the lists. */
+static BOOL software_panel_scrolls(void)
+{
+    if (app->software_type == SOFTWARE_OVERVIEW)
+        return software_overview_count() > SOFTWARE_LIST_LINES;
+    return get_software_list(app->software_type) != NULL;
+}
+
 static void draw_software_overview(void)
 {
+    struct RastPort *rp = app->rp;
     char buffer[80];
-    ULONG row;
+    ULONG row, last, count = software_overview_count();
     WORD y = SOFTWARE_PANEL_Y + 22;
+    WORD right = SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 4;
 
-    for (row = 0; row < software_overview_count(); row++) {
+    row = 0;
+    if (count > SOFTWARE_LIST_LINES) {
+        /* Leave the scroll bar alone and erase rows that scrolled away. */
+        right = SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 16;
+        SetAPen(rp, COLOR_PANEL_BG);
+        RectFill(rp, SOFTWARE_PANEL_X + 2, y - 7, right,
+                 SOFTWARE_PANEL_Y + SOFTWARE_PANEL_H - 2);
+        row = app->software_scroll;
+    }
+    /* As many rows as the scroll bar and arrows count with. */
+    last = row + SOFTWARE_LIST_LINES;
+    for (; row < count && row < last; row++) {
         const char *value = format_software_overview_value(row, buffer,
                                                           sizeof(buffer));
         draw_label_value_max(SOFTWARE_PANEL_X + 4, y,
                              get_string(software_overview_label(row)), value,
-                             100, SOFTWARE_PANEL_X + SOFTWARE_PANEL_W - 4);
+                             100, right);
         y += TEXT_LINE_HEIGHT;
     }
 }
@@ -1443,15 +1628,14 @@ static void update_software_list(BOOL clear_content)
         }
     }
 
-    set_button_enabled(BTN_SOFTWARE_UP, list != NULL);
-    set_button_enabled(BTN_SOFTWARE_DOWN, list != NULL);
-    set_button_enabled(BTN_SOFTWARE_SCROLLBAR, list != NULL);
-    if (app->software_type == SOFTWARE_OVERVIEW) {
-        draw_software_overview();
+    set_button_enabled(BTN_SOFTWARE_UP, software_panel_scrolls());
+    set_button_enabled(BTN_SOFTWARE_DOWN, software_panel_scrolls());
+    set_button_enabled(BTN_SOFTWARE_SCROLLBAR, software_panel_scrolls());
+    if (!software_panel_scrolls()) {
+        if (app->software_type == SOFTWARE_OVERVIEW)
+            draw_software_overview();
         return;
     }
-    if (!list)
-        return;
 
     /* Draw scroll arrows with triangles */
     Button *up_btn = find_button(BTN_SOFTWARE_UP);
@@ -1471,7 +1655,12 @@ static void update_software_list(BOOL clear_content)
     if (scrollbar_btn) {
         draw_scroll_bar(scrollbar_btn->x, scrollbar_btn->y,
                         scrollbar_btn->width, scrollbar_btn->height,
-                        app->software_scroll, list->count, SOFTWARE_LIST_LINES);
+                        app->software_scroll, software_row_count(),
+                        SOFTWARE_LIST_LINES);
+    }
+    if (app->software_type == SOFTWARE_OVERVIEW) {
+        draw_software_overview();
+        return;
     }
 
     /* Draw list entries */
@@ -1890,21 +2079,21 @@ static void draw_speed_panel_contents(BOOL redraw_scale_button)
         const WORD column_width = 42;
 
         /* Format CHIP speed in MB/s */
-        if (bench_results.benchmarks_valid && bench_results.chip_speed > 0) {
+        if (bench_results.chip_speed > 0) {
             format_scaled(chip_str, sizeof(chip_str), bench_results.chip_speed / 10000, TRUE);
         } else {
             snprintf(chip_str, sizeof(chip_str), "%s", get_string(MSG_NA));
         }
 
         /* Format FAST speed in MB/s or N/A */
-        if (bench_results.benchmarks_valid && bench_results.fast_speed > 0) {
+        if (bench_results.fast_speed > 0) {
             format_scaled(fast_str, sizeof(fast_str), bench_results.fast_speed / 10000, TRUE);
         } else {
             snprintf(fast_str, sizeof(fast_str), "%s", get_string(MSG_NA));
         }
 
         /* Format ROM speed in MB/s */
-        if (bench_results.benchmarks_valid && bench_results.rom_speed > 0) {
+        if (bench_results.rom_speed > 0) {
             format_scaled(rom_str, sizeof(rom_str), bench_results.rom_speed / 10000, TRUE);
         } else {
             snprintf(rom_str, sizeof(rom_str), "%s", get_string(MSG_NA));
@@ -2032,11 +2221,28 @@ static void collect_hardware_row(const HardwareInfoRow *info, void *data)
     }
 }
 
+/* Formatting the rows takes about 35 ms on a 68000, so keep them across
+ * redraws. They change with the page, cache settings and benchmark
+ * results, which invalidate them; the clock page changes every second. */
+static BOOL hardware_rows_valid;
+static HardwareType hardware_rows_type;
+
+static void invalidate_hardware_rows(void)
+{
+    hardware_rows_valid = FALSE;
+}
+
 static void build_hardware_rows(void)
 {
+    if (hardware_rows_valid && hardware_rows_type == app->hardware_type &&
+        app->hardware_type != HARDWARE_CLOCK)
+        return;
+
     hardware_row_count = 0;
     visit_hardware_rows(app->hardware_type, collect_hardware_row, NULL);
     layout_hardware_rows();
+    hardware_rows_type = app->hardware_type;
+    hardware_rows_valid = TRUE;
 }
 
 /*
@@ -2139,7 +2345,7 @@ void handle_button_press(ButtonID btn_id)
 void handle_scrollbar_click(WORD mx __attribute__((unused)), WORD my)
 {
     Button *scrollbar_btn = find_button(BTN_SOFTWARE_SCROLLBAR);
-    SoftwareList *list = get_software_list(app->software_type);
+    ULONG rows = software_row_count();
     WORD knob_y, knob_h, travel;
     LONG max_scroll, new_scroll;
 
@@ -2149,12 +2355,12 @@ void handle_scrollbar_click(WORD mx __attribute__((unused)), WORD my)
     }
 
     if (app->current_view != VIEW_MAIN || !scrollbar_btn ||
-        !scrollbar_btn->enabled || !list) return;
+        !scrollbar_btn->enabled || !rows) return;
 
-    max_scroll = (LONG)list->count - SOFTWARE_LIST_LINES;
+    max_scroll = (LONG)rows - SOFTWARE_LIST_LINES;
     if (max_scroll <= 0) return;
 
-    scrollbar_knob(scrollbar_btn->height, app->software_scroll, list->count,
+    scrollbar_knob(scrollbar_btn->height, app->software_scroll, rows,
                    SOFTWARE_LIST_LINES, &knob_y, &knob_h);
     travel = scrollbar_btn->height - 2 - knob_h;
     if (travel <= 0) return;
@@ -2374,7 +2580,6 @@ static void show_status_overlay_centered(const char *message,
     /* Draw centered message */
     SetAPen(rp, COLOR_HIGHLIGHT);  /* White text in both palettes */
     SetBPen(rp, COLOR_BAR_YOU);
-    TextLength(rp, (CONST_STRPTR)message, text_len);
     Move(rp, dialog_x + (dialog_w - text_width) / 2, dialog_y + 16);
     Text(rp, (CONST_STRPTR)message, text_len);
 }
@@ -2451,7 +2656,6 @@ static void draw_requester_field(WORD field_x, WORD field_y, WORD field_w, WORD 
     if (filename[cursor_pos]) {
         SetAPen(rp, COLOR_BACKGROUND);
         SetBPen(rp, COLOR_TEXT);
-        TextLength(rp, (CONST_STRPTR)&filename[cursor_pos], 1);
         Move(rp, cursor_x, field_y + 10);
         Text(rp, (CONST_STRPTR)&filename[cursor_pos], 1);
     }
